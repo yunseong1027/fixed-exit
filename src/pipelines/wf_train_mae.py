@@ -46,6 +46,13 @@ def train_er(X_tr, yR_tr, X_va, yR_va, X_te, seed):
           callbacks=[early_stopping(200), log_evaluation(200)])
     return r, r.predict(X_va), r.predict(X_te)
 
+def quantile_offset(y_true, q_pred, p):
+    """Split-conformal style constant offset: delta = quantile_p(y - qhat)."""
+    resid = (np.asarray(y_true) - np.asarray(q_pred))
+    resid = resid[np.isfinite(resid)]
+    if len(resid) == 0: return 0.0
+    return float(np.quantile(resid, p))
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="data/processed/meta_train.parquet")
@@ -55,9 +62,13 @@ def main():
     ap.add_argument("--val-years",   type=int, default=1)
     ap.add_argument("--test-years",  type=int, default=1)
     ap.add_argument("--alpha", dest="alphas", action="append", type=float,
-                    help="반복 사용: --alpha 0.85 --alpha 0.90 --alpha 0.95")
+                    help="repeatable: --alpha 0.85 --alpha 0.90 --alpha 0.95")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--outdir", default="reports/wf_mae")
+    ap.add_argument("--conformal", action="store_true",
+                    help="compute delta on val: delta = quantile_p(y - qhat)")
+    ap.add_argument("--cf-p", type=float, default=None,
+                    help="quantile level p for delta (default: alpha)")
     args = ap.parse_args()
 
     Path(args.outdir).mkdir(parents=True, exist_ok=True)
@@ -80,21 +91,31 @@ def main():
 
         # E[R]는 fold당 한 번 학습
         r, r_va, r_te = train_er(trX, tr_yR, vaX, va_yR, teX, args.seed)
-        # 저장 (E[R]는 알파에 무관하므로 공통 파일명에도 저장)
         pd.DataFrame({"date": vaX.index, "E_R": r_va}).set_index("date").to_parquet(Path(args.outdir)/f"fold{k:02d}_val_E_R.parquet")
         pd.DataFrame({"date": teX.index, "E_R": r_te}).set_index("date").to_parquet(Path(args.outdir)/f"fold{k:02d}_test_E_R.parquet")
 
-        # 각 α에 대해 q_mae 학습/저장
+        # 각 α에 대해 q_mae 학습/저장 + (옵션) delta 저장
         cover = {}
+        delta_dict = {}
         for a in alphas:
             q, q_va, q_te = train_q(trX, tr_yq, vaX, va_yq, teX, a, args.seed)
             tag = f"a{int(round(a*100)):02d}"
+            # preds
             pd.DataFrame({"date": vaX.index, "q_mae": q_va}).set_index("date").to_parquet(Path(args.outdir)/f"fold{k:02d}_val_q_{tag}.parquet")
             pd.DataFrame({"date": teX.index, "q_mae": q_te}).set_index("date").to_parquet(Path(args.outdir)/f"fold{k:02d}_test_q_{tag}.parquet")
-            cover[tag] = {
-                "coverage_val": float((va_yq.values <= q_va).mean()),
-                "coverage_test": float((te_yq.values <= q_te).mean())
-            }
+            # coverage
+            cov_va = float((va_yq.values <= q_va).mean())
+            cov_te = float((te_yq.values <= q_te).mean())
+            cover[tag] = {"coverage_val":cov_va, "coverage_test":cov_te}
+
+            # delta (Block-Conformal Offset)
+            if args.conformal:
+                p = a if (args.cf_p is None) else args.cf_p
+                delta = quantile_offset(va_yq.values, q_va, p=p)
+                delta_dict[tag] = delta
+                # store a small json per-fold per-alpha (optional but handy)
+                Path(args.outdir).mkdir(parents=True, exist_ok=True)
+                (Path(args.outdir)/f"fold{k:02d}_val_q_{tag}_delta.json").write_text(json.dumps({"delta": delta}, indent=2), encoding="utf-8")
 
         meta.append({
             "fold": k,
@@ -102,13 +123,17 @@ def main():
             "val":   [str(tr_e),str(va_e)],
             "test":  [str(va_e),str(te_e)],
             "n_tr": len(trX), "n_va": len(vaX), "n_te": len(teX),
-            "alphas": alphas, "coverage": cover
+            "alphas": alphas,
+            "coverage": cover,
+            "delta": delta_dict
         })
 
-    with open(Path(args.outdir)/"wf_meta.json","w") as f:
+    with open(Path(args.outdir)/"wf_meta.json","w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
     print(f"[saved] wf_meta -> {args.outdir}/wf_meta.json")
     print(f"[saved] preds per fold per alpha -> {args.outdir}/fold##_val_q_aXX.parquet & fold##_test_q_aXX.parquet + E_R")
+    if args.conformal:
+        print("[note] conformal delta saved alongside (fold##_val_q_{tag}_delta.json)")
 
 if __name__ == "__main__":
     main()

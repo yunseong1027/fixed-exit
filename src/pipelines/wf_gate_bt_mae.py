@@ -2,7 +2,6 @@ import argparse, json
 from pathlib import Path
 import numpy as np, pandas as pd
 
-# ---------- 재사용 유틸 (랜덤/올인/CI) ----------
 try:
     from .gate_bt_mae import (
         evaluate_random, evaluate_all, block_bootstrap_metrics
@@ -14,7 +13,6 @@ except ImportError:
         evaluate_random, evaluate_all, block_bootstrap_metrics
     )
 
-# ---------- 지표 유틸 ----------
 def mdd_from_equity(eq):
     peak = np.maximum.accumulate(eq)
     dd = 1.0 - eq/peak
@@ -28,20 +26,20 @@ def cagr_from_equity(eq, total_days):
     total = eq[-1] / eq[0]
     return float(total**(1/years) - 1.0)
 
-# ---------- 캘린더 스케줄러 (max-concurrent 지원) ----------
 def eval_from_mask_calendar(df_te, pick_mask, cost, max_concurrent=1):
     """
-    전체 영업일 캘린더 기준으로 누적. 동시 보유 상한(max_concurrent) 지원.
-    df_te.index: 후보일(날짜) — 내부에서 캘린더 생성하여 매핑.
+    캘린더(전체 영업일) 기준 누적
+    - 동시 보유 시 동일가중 평균으로 하루 수익 합성
+    - per-trade 비용은 당일 새로 진입한 포지션의 가중치만큼 1회 차감
     """
-    # 1) 캘린더 생성
+    # 1) 캘린더
     cal_start = pd.to_datetime(df_te.index.min()).normalize()
     cal_end   = pd.to_datetime(df_te.index.max()).normalize()
     cal = pd.date_range(cal_start, cal_end, freq="B")
     T = len(cal)
     idx_map = {d.normalize(): i for i, d in enumerate(cal)}
 
-    # 2) 후보 진입 인덱스
+    # 2) 엔트리 빌드
     R = df_te["y_R"].values
     D = df_te["y_dur"].round().clip(lower=1).astype(int).values
     entries = []
@@ -55,74 +53,98 @@ def eval_from_mask_calendar(df_te, pick_mask, cost, max_concurrent=1):
 
     # 3) 누적
     eq = np.ones(T + 1, dtype=float)
-    active = []  # list of (endpos, daily_ret, started?)
+    # active: (endpos, daily_ret, started?)
+    active = []
     accepted = skipped = 0
 
     for t in range(T):
         # 만기 제거
-        active = [(e, dr, started) for (e, dr, started) in active if e > t]
-
-        # 오늘 엔트리 시작
-        todays = [e for e in entries if e[0] == t]
-        for _, r_total, d in todays:
-            if len(active) >= max_concurrent:
-                skipped += 1
-                continue
-            d = max(d, 1)
-            dr = (1.0 + r_total)**(1.0/d) - 1.0
-            active.append((t + d, dr, False))
-            accepted += 1
-
-        # 오늘 일일 수익(동시보유: ∏(1+dr_i)-1), 진입일에는 cost 1회
         if active:
-            gross = 1.0
-            new_active = []
-            for (e, dr, started) in active:
-                if not started:
-                    gross *= (1.0 + dr - cost)
-                    started = True
-                else:
-                    gross *= (1.0 + dr)
-                new_active.append((e, dr, started))
-            active = new_active
-            eq[t+1] = eq[t] * gross
+            active = [(e, dr, st) for (e, dr, st) in active if e > t]
+
+        # 오늘 엔트리
+        todays = [e for e in entries if e[0] == t]
+        # 동시보유 상한
+        if max_concurrent is not None and len(active) + len(todays) > max_concurrent:
+            room = max(0, max_concurrent - len(active))
+            if room < len(todays):
+                # 들어온 순서대로 컷(원한다면 크기 기준 정렬해도 됨)
+                kept, dropped = todays[:room], todays[room:]
+                skipped += len(dropped)
+                todays = kept
+
+        # 오늘 시작할 포지션 daily_ret 계산
+        new_active = []
+        for (_, rtot, d) in todays:
+            d = max(d, 1)
+            dr = (1.0 + rtot)**(1.0 / d) - 1.0
+            new_active.append((t + d, dr, False))
+        if new_active:
+            accepted += len(new_active)
+            active.extend(new_active)
+
+        # 하루 수익 합성(동일가중) + 비용(새 진입 가중치만큼)
+        if active:
+            m = len(active)
+            # 평균 수익
+            avg_dr = sum(dr for (_, dr, __) in active) / m
+            # 오늘 새 진입 수
+            n_new = sum(1 for (_, __, st) in active if not st)
+            # 비용은 새 진입 가중치만큼 차감
+            cost_pen = (n_new / m) * cost if m > 0 else 0.0
+
+            # started 플래그 갱신
+            active = [(e, dr, True) for (e, dr, st) in active]
+
+            # 자본 갱신 (과대 레버리지 방지: 더 이상 ∏ 사용 안 함)
+            port_ret = avg_dr - cost_pen
+            eq[t+1] = eq[t] * (1.0 + port_ret)
         else:
             eq[t+1] = eq[t]
 
+    # 성과 지표
     total_days = T
-    mdd = mdd_from_equity(eq)
-    cagr = cagr_from_equity(eq, total_days)
-    calmar = cagr / mdd if mdd > 0 else np.inf
+    mdd  = mdd_from_equity(eq)
+    cagr = cagr_from_equity(eq, total_days)   # 연 252일 가정
+    calmar = (cagr / mdd) if mdd > 0 else np.inf
     return {"CAGR": cagr, "MDD": mdd, "Calmar": calmar,
             "accepted": accepted, "skipped": skipped, "days": total_days}
 
-# ---------- (τ, θ) 선택: 그리드 / Dinkelbach 내부 목적 ----------
+# 파라미터 대입
 def pick_on_val_grid(vv, tau_qs, theta_bps, theta_pctls, cost, max_concurrent,
                      enforce_rand=True, select="calmar", mu=None, mu_eps=1e-4):
-    """
-    - theta_bps: 절대 임계(bps 리스트)
-    - theta_pctls: 상대 임계(퍼센타일 리스트; val E[R] 기준)
-    """
-    qs_vals = np.percentile(vv["q_mae_adj"].values, tau_qs)
-    best = None; best_key = None
+    qarr = vv["q_mae_adj"].to_numpy()
+    qarr = qarr[np.isfinite(qarr)]
+    if qarr.size == 0:
+        return None
+    qs_vals = np.nanpercentile(qarr, tau_qs)
 
-    # 상대 θ 집합
+    best = None
+    best_key = None
+
     thetas_all = list(theta_bps or [])
     if theta_pctls:
-        Er = vv["E_R"].values
-        for p in theta_pctls:
-            try:
-                thetas_all.append(float(np.nanpercentile(Er, p)))
-            except Exception:
-                pass
+        er = vv["E_R"].to_numpy()
+        er = er[np.isfinite(er)]
+        if er.size:
+            for p in theta_pctls:
+                try:
+                    thetas_all.append(float(np.nanpercentile(er, p)))
+                except Exception:
+                    pass
+    # 후보가 하나도 없으면 기본 0.0만 남기기
+    if not thetas_all:
+        thetas_all = [0.0]
 
     rng = np.random.RandomState(42)
 
     for tau, tau_q in zip(tau_qs, qs_vals):
         for th in thetas_all:
             pick = ((vv["q_mae_adj"] <= tau_q) & (vv["E_R"] >= th)).values
+            if pick.size == 0:
+                continue
             acc_rate = float(pick.mean())
-            if acc_rate == 0.0:
+            if not np.isfinite(acc_rate) or acc_rate == 0.0:
                 continue
 
             gate = eval_from_mask_calendar(vv, pick, cost, max_concurrent=max_concurrent)
@@ -132,10 +154,8 @@ def pick_on_val_grid(vv, tau_qs, theta_bps, theta_pctls, cost, max_concurrent,
                 continue
 
             if mu is None:
-                # Calmar 최대 or MDD 최소
                 key = (-gate["Calmar"], gate["MDD"]) if select == "calmar" else (gate["MDD"], -gate["Calmar"])
             else:
-                # Dinkelbach 내부 목적 J_mu
                 J = gate["CAGR"] - mu * (gate["MDD"] + mu_eps)
                 key = (-J,)
 
@@ -146,7 +166,7 @@ def pick_on_val_grid(vv, tau_qs, theta_bps, theta_pctls, cost, max_concurrent,
                         "Rand_CAGR": rnd["CAGR"], "Rand_MDD": rnd["MDD"], "Rand_Calmar": rnd["Calmar"]}
     return best
 
-def dinkelbach_on_val(vv, tau_qs, theta_bps, theta_pctls, cost, max_concurrent,
+def validation(vv, tau_qs, theta_bps, theta_pctls, cost, max_concurrent,
                       mu_init=0.5, mu_eps=1e-4, mu_tol=1e-4, mu_max_iter=10,
                       enforce_rand=True):
     mu = float(mu_init); hist=[]
@@ -170,36 +190,31 @@ def dinkelbach_on_val(vv, tau_qs, theta_bps, theta_pctls, cost, max_concurrent,
     best.update({"mu_final": mu, "phi_final": best["CAGR"] - mu*(best["MDD"] + mu_eps), "db_iters": mu_max_iter})
     return best, hist
 
-# ---------- 메인 ----------
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data",  default="data/processed/meta_train.parquet")
     ap.add_argument("--wfdir", default="reports/wf_mae")
-
-    # 스케줄/비용/레짐
     ap.add_argument("--max-concurrent", type=int, default=1)
     ap.add_argument("--rv-cap-pct", type=float, default=None)
     ap.add_argument("--cost", type=float, default=0.0005)
-
-    # 그리드 파라미터
     ap.add_argument("--tau-q", dest="tau_qs", action="append", type=int)
     ap.add_argument("--theta", dest="thetas", action="append", type=float, help="absolute θ(bps)")
     ap.add_argument("--theta-pctl", dest="theta_pctls", action="append", type=float, help="relative θ(percentile on val E[R])")
     ap.add_argument("--alpha", dest="alphas", action="append", type=float)
     ap.add_argument("--qmae-buf", dest="qbufs", action="append", type=float)
-
-    # Dinkelbach
-    ap.add_argument("--use-dinkelbach", action="store_true")
+    ap.add_argument("--use-optimization", action="store_true")
     ap.add_argument("--mu-init", type=float, default=0.5)
     ap.add_argument("--mu-eps",  type=float, default=1e-4)
     ap.add_argument("--mu-tol",  type=float, default=1e-4)
     ap.add_argument("--mu-max-iter", type=int, default=10)
     ap.add_argument("--relax-rand-constraint", action="store_true")
-
-    # 리얼리즘 요약 옵션(NEW)
     ap.add_argument("--dd-eps", type=float, default=1e-3, help="MDD floor for Calmar_eps (e.g., 0.001=10bp)")
     ap.add_argument("--min-trades", type=int, default=3, help="min accepted trades per fold included in summary")
-
+    ap.add_argument("--use-conformal", action="store_true",
+                    help="apply delta stored by wf_train_mae: q_mae_adj = q_mae + delta (+ qbuf)")
+    ap.add_argument("--delta-from-json", action="store_true",
+                    help="prefer per-fold delta JSON (fold##_val_q_aXX_delta.json) over wf_meta.json")
     ap.add_argument("--outdir", default="reports/wf_gate")
     args = ap.parse_args()
 
@@ -252,14 +267,31 @@ def main():
                 rows.append({"fold": m["fold"], "alpha": a, "status": "empty_after_q_join"})
                 continue
 
+            # delta 로드
+            delta = 0.0
+            if args.use_conformal:
+                if args.delta_from_json:
+                    jp = Path(args.wfdir)/f"fold{m['fold']:02d}_val_q_{tag}_delta.json"
+                    if jp.exists():
+                        try:
+                            delta = float(json.loads(jp.read_text(encoding="utf-8")).get("delta", 0.0))
+                        except Exception:
+                            delta = 0.0
+                if delta == 0.0 and "delta" in m and tag in m["delta"]:
+                    try:
+                        delta = float(m["delta"][tag])
+                    except Exception:
+                        delta = 0.0
+
             for eps in qbufs:
                 vv = v.copy(); tt = t.copy()
-                vv["q_mae_adj"] = vv["q_mae"] + eps
-                tt["q_mae_adj"] = tt["q_mae"] + eps
+                # delta + qbuf 적용
+                vv["q_mae_adj"] = vv["q_mae"] + (delta if args.use_conformal else 0.0) + eps
+                tt["q_mae_adj"] = tt["q_mae"] + (delta if args.use_conformal else 0.0) + eps
 
                 # (1) val에서 선택
-                if args.use_dinkelbach:
-                    best, hist = dinkelbach_on_val(
+                if args.use_optimization:
+                    best, hist = validation(
                         vv, tau_qs, thetas, theta_pctls, cost=args.cost,
                         max_concurrent=args.max_concurrent,
                         mu_init=args.mu_init, mu_eps=args.mu_eps,
@@ -289,7 +321,7 @@ def main():
                 ci   = block_bootstrap_metrics(tt, pick_te, cost=args.cost, scheduler="exclusive_duration",
                                                block=20, B=200, seed=42)
 
-                row = {"fold": m["fold"], "alpha": a, "qbuf": eps, "tau_val": float(tau_val), "theta": float(theta),
+                row = {"fold": m["fold"], "alpha": a, "qbuf": eps, "tau_val": float(tau_val), "theta": float(theta), "delta": float(delta),
                        "Gate_CAGR": gate["CAGR"], "Gate_MDD": gate["MDD"], "Gate_Calmar": gate["Calmar"],
                        "Rand_CAGR": rnd["CAGR"],  "Rand_MDD": rnd["MDD"],  "Rand_Calmar": rnd["Calmar"],
                        "All_CAGR":  alln["CAGR"], "All_MDD":  alln["MDD"], "All_Calmar":  alln["Calmar"],
@@ -297,20 +329,18 @@ def main():
                        "Gate_MDD_CI_low":  ci["MDD_CI"][0],  "Gate_MDD_CI_high":  ci["MDD_CI"][1],
                        "accepted": gate["accepted"], "skipped": gate["skipped"], "days": gate["days"],
                        "status": "ok"}
-                if args.use_dinkelbach and ("mu_final" in best):
+                if args.use_optimization and ("mu_final" in best):
                     row.update({"mu_final": best["mu_final"], "phi_final": best["phi_final"], "db_iters": best["db_iters"]})
                 rows.append(row)
 
-    # --- 저장/요약 (inf 방지: ε-Calmar + 최소 체결 수 필터) ---
-    outdir = Path(args.outdir); outdir.mkdir(parents=True, exist_ok=True)
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
     out = pd.DataFrame(rows)
-    # ε-Calmar
+    # ε-Calmar (MDD=0 대비)
     eps = args.dd_eps
     for who in ["Gate", "Rand", "All"]:
         out[f"{who}_Calmar_eps"] = out[f"{who}_CAGR"] / (out[f"{who}_MDD"] + eps)
-
     out.to_csv(outdir / "wf_results_per_fold.csv", index=False)
-
     # 집계(품질 필터: 최소 체결수)
     mask = (out["status"] == "ok") & (out["accepted"] >= args.min_trades)
     grp = out[mask].groupby(["alpha", "qbuf"])
@@ -327,14 +357,14 @@ def main():
                       "All_CAGR",  "All_MDD",  "All_Calmar_eps"]].median().reset_index()
     agg_median.to_csv(outdir / "wf_summary_by_alpha_qbuf_median.csv", index=False)
 
-    # 콘솔 출력은 중앙값 기준 Top-10
+    # 중앙값 기준 Top-10 출력
     if len(agg_median):
         print("\n=== WF summary (median ε-Calmar; mean/median CSV 저장) ===")
         print(agg_median.sort_values(["Gate_Calmar_eps"], ascending=False).head(10))
     else:
         print("\n=== WF summary ===\n(no rows after min-trades filter)")
 
-    # Dinkelbach 로그
+    # 최적화 로그
     if len([1 for _ in db_logs]):
         with open(outdir / "wf_db_logs.json", "w") as f:
             json.dump(db_logs, f, indent=2)
@@ -343,7 +373,7 @@ def main():
     print(f"[saved] mean  -> {outdir}/wf_summary_by_alpha_qbuf_mean.csv")
     print(f"[saved] median-> {outdir}/wf_summary_by_alpha_qbuf_median.csv")
     if len([1 for _ in db_logs]):
-        print(f"[saved] Dinkelbach logs -> {outdir}/wf_db_logs.json")
+        print(f"[saved] optimization logs -> {outdir}/wf_db_logs.json")
 
 if __name__ == "__main__":
     main()
